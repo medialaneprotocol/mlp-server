@@ -7,7 +7,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::accept_async;
 
 use mlp_core::media::cells::CellGrid;
-use mlp_core::media::pdu::Carrier;
+use mlp_core::media::pdu::{Carrier, Fragment};
 use mlp_core::media::sender::{MediaSenderConfig, MediaSenderMachine};
 
 #[tokio::main]
@@ -41,14 +41,27 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr) {
         grid,
         now,
     );
-    let _ = sender;
 
-    // Echo loop: receive fragments, send acks.
+    // Send initial limits as a control fragment.
+    let limits = format!("{{\"protocol_version\":{}}}", mlp_core::media::pdu::MEDIA_PROTOCOL_VERSION);
+    let _ = sink.send(Message::Text(limits.into())).await;
+
     while let Some(msg) = source.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                // Parse fragment, send back echo (simplified).
-                let _ = sink.send(Message::Binary(data)).await;
+                // Try to parse as a fragment.
+                if let Ok((frag, _)) = Fragment::parse(&data, Carrier::Ws) {
+                    println!("received fragment: class={:?} object_id={}", frag.header.class, frag.header.object_id);
+                    // Echo back.
+                    let _ = sink.send(Message::Binary(data)).await;
+                } else {
+                    // Not a valid fragment, echo anyway.
+                    let _ = sink.send(Message::Binary(data)).await;
+                }
+            }
+            Ok(Message::Text(text)) => {
+                println!("received text: {}", text);
+                let _ = sink.send(Message::Text(text)).await;
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
@@ -58,5 +71,6 @@ async fn handle_connection(stream: TcpStream, peer: SocketAddr) {
             }
         }
     }
+    let _ = sender;
     println!("connection closed: {}", peer);
 }
