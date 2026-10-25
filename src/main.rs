@@ -1,147 +1,79 @@
-//! mlp-server: reference WebSocket server for MLP.
+//! mlp-server: the reference WebSocket host for the Media Lane Protocol.
+//!
+//! One process, two listeners: the media lane speaks `mlp-v1` WebSocket
+//! fragments (MLP_PORT, default 8080), and a plain HTTP listener serves the
+//! core telemetry sink's eight counters (MLP_METRICS_PORT, default 9090).
 
-use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
-use std::net::SocketAddr;
+mod session;
+mod wire;
+
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::accept_async;
 
-use mlp_core::media::cells::CellGrid;
-use mlp_core::media::pdu::{Carrier, Fragment, MEDIA_PROTOCOL_VERSION};
-use mlp_core::media::sender::{MediaSenderConfig, MediaSenderMachine};
-use mlp_core::media::receiver::{MediaReceiverConfig, MediaReceiverMachine};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionState {
-    Handshaking,
-    Active,
-    Parked,
-    Closing,
-    Closed,
-}
-
-#[allow(dead_code)]
-struct Session {
-    id: u64,
-    state: SessionState,
-    sender: MediaSenderMachine,
-    receiver: MediaReceiverMachine,
-    grid: CellGrid,
-}
-
-impl Session {
-    fn new(id: u64) -> Self {
-        let grid = CellGrid::with_cell_size(320, 240, 64);
-        let now = std::time::Instant::now();
-        Self {
-            id,
-            state: SessionState::Handshaking,
-            sender: MediaSenderMachine::new(MediaSenderConfig::new(Carrier::Ws, grid), grid, now),
-            receiver: MediaReceiverMachine::new(MediaReceiverConfig::for_carrier(Carrier::Ws), now),
-            grid,
-        }
-    }
-}
-
-type Sessions = Arc<Mutex<HashMap<u64, Session>>>;
+use session::Shared;
 
 #[tokio::main]
 async fn main() {
-    let addr = "0.0.0.0:8080";
-    let listener = TcpListener::bind(addr).await.expect("bind failed");
-    println!("mlp-server listening on {}", addr);
+    let lane_port: u16 = std::env::var("MLP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+    let metrics_port: u16 = std::env::var("MLP_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
 
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let next_id = Arc::new(Mutex::new(1u64));
+    let shared = Shared::new();
+    tokio::spawn(serve_metrics(metrics_port, shared.clone()));
+
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", lane_port))
+        .await
+        .expect("the media lane's port is bindable");
+    println!("mlp-server: media lane on :{lane_port} (mlp-v1), metrics on :{metrics_port}");
 
     loop {
-        if let Ok((stream, peer)) = listener.accept().await {
-            let sessions = sessions.clone();
-            let next_id = next_id.clone();
-            tokio::spawn(handle_connection(stream, peer, sessions, next_id));
+        if let Ok((stream, _peer)) = listener.accept().await {
+            let shared = shared.clone();
+            tokio::spawn(session::serve(stream, shared));
         }
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    peer: SocketAddr,
-    sessions: Sessions,
-    next_id: Arc<Mutex<u64>>,
-) {
-    println!("new connection from {}", peer);
-    let ws = match accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            eprintln!("ws accept error: {}", e);
-            return;
-        }
+/// GET /metrics renders the telemetry sink; anything else is a 404.
+async fn serve_metrics(port: u16, shared: Arc<Shared>) {
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(listener) => listener,
+        Err(_) => return,
     };
-    let (mut sink, mut source) = ws.split();
-
-    // Create session.
-    let sid = {
-        let mut id = next_id.lock().await;
-        let v = *id;
-        *id += 1;
-        v
-    };
-    let mut session = Session::new(sid);
-    println!("session {} created for {}", sid, peer);
-
-    // Send handshake (limits).
-    let handshake = format!(
-        "{{\"session_id\":{},\"protocol_version\":{},\"status\":\"ok\"}}",
-        sid, MEDIA_PROTOCOL_VERSION
-    );
-    let _ = sink.send(Message::Text(handshake.into())).await;
-    session.state = SessionState::Active;
-
-    // Main loop.
-    while let Some(msg) = source.next().await {
-        match msg {
-            Ok(Message::Binary(data)) => {
-                if let Ok((frag, _)) = Fragment::parse(&data, Carrier::Ws) {
-                    println!(
-                        "session {}: fragment class={:?} object_id={}",
-                        sid, frag.header.class, frag.header.object_id
-                    );
-                    // Echo back.
-                    let _ = sink.send(Message::Binary(data)).await;
-                } else {
-                    let _ = sink.send(Message::Binary(data)).await;
-                }
-            }
-            Ok(Message::Text(text)) => {
-                println!("session {}: text: {}", sid, text);
-                if text.contains("close") {
-                    session.state = SessionState::Closing;
-                    let _ = sink.send(Message::Text("{\"status\":\"closing\"}".into())).await;
-                    break;
-                }
-                if text.contains("park") {
-                    session.state = SessionState::Parked;
-                    let _ = sink.send(Message::Text("{\"status\":\"parked\"}".into())).await;
-                } else if text.contains("resume") {
-                    session.state = SessionState::Active;
-                    let _ = sink.send(Message::Text("{\"status\":\"active\"}".into())).await;
-                } else {
-                    let _ = sink.send(Message::Text(text)).await;
-                }
-            }
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("session {} ws error: {}", sid, e);
-                break;
-            }
-        }
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let read = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(read)) => read,
+                _ => return,
+            };
+            let head = String::from_utf8_lossy(&buf[..read]);
+            let is_metrics = head.starts_with("GET /metrics") || head.starts_with("get /metrics");
+            let (status, body) = if is_metrics {
+                ("200 OK", shared.telemetry.render())
+            } else {
+                ("404 Not Found", String::new())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
     }
-
-    session.state = SessionState::Closed;
-    sessions.lock().await.insert(sid, session);
-    println!("session {} closed: {}", sid, peer);
 }

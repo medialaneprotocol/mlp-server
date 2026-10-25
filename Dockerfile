@@ -5,5 +5,5 @@ RUN cargo build --release
 
 FROM debian:trixie-slim
 COPY --from=build /app/target/release/mlp-server /usr/local/bin/mlp-server
-EXPOSE 8080
+EXPOSE 8080 9090
 ENTRYPOINT ["mlp-server"]

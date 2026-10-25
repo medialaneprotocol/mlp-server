@@ -9,7 +9,7 @@ repository = "https://github.com/medialaneprotocol/mlp-server"
 publish = false
 
 [dependencies]
-mlp-core = { git = "https://github.com/medialaneprotocol/mlp-core", rev = "b6d45236d57566286dd5b5493fa65741f58332a1" }
+mlp-core = { git = "https://github.com/medialaneprotocol/mlp-core", rev = "074cfed234d6b97a75ef91ff0e34f8623afbdcb8" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
