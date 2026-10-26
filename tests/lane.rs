@@ -160,7 +160,7 @@ async fn the_lane_speaks_the_protocol_end_to_end() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let result = run_lane(lane_port, metrics_port).await;
-    let _ = server.kill().wait();
+    let _ = server.kill();
     result.expect("the lane held the contract");
 }
 
